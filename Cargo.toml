@@ -17,6 +17,12 @@ tokio-byteorder = "0.3.0"
 tokio-stream = {version = "0.1.9", features = ["net"]}
 tonic = "0.7.2"
 uuid = { version = "1.1.2", features = ["v4"] }
+tracing = "0.1.35"
+tracing-appender = "0.2.2"
+tracing-bunyan-formatter = "0.3.3"
+tracing-futures = "0.2.5"
+tracing-subscriber = { version = "0.3.15", features = ["env-filter"] }
+tracing-tree = "0.2.1"
 
 [dev-dependencies]
 mockall = "0.11.1"

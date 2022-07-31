@@ -1,13 +1,15 @@
 use anyhow::Result;
+use tracing::info;
 
+use crate::fs;
 use async_trait::async_trait;
 use std::{
   collections::{BTreeMap, HashMap},
-  io::SeekFrom,
+  io::{ErrorKind, SeekFrom},
 };
 use tokio::{
   fs::File,
-  io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter},
+  io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
   sync::RwLock,
 };
 
@@ -46,6 +48,7 @@ pub struct KVInner<L: LogStore> {
 }
 
 impl<L: LogStore> Kv<L> {
+  #[tracing::instrument(skip_all, fields(dir = %dir))]
   pub fn new(dir: String, commit_log: L) -> Result<Self> {
     Ok(Self {
       inner: RwLock::new(KVInner {
@@ -59,6 +62,7 @@ impl<L: LogStore> Kv<L> {
     })
   }
 
+  #[tracing::instrument(skip_all, fields(dir = %dir))]
   fn get_latest_ss_table_id(dir: &str) -> Result<Option<u32>> {
     let files = std::fs::read_dir(dir)?
       .map(|entry| entry.map(|e| e.path()))
@@ -67,7 +71,7 @@ impl<L: LogStore> Kv<L> {
       .map(|path| path.to_str().map(String::from).unwrap());
 
     let latest_id = files
-      .filter(|path| path.starts_with("sstable."))
+      .filter(|path| path.contains("sstable."))
       .map(|path| {
         path
           .split_once('.')
@@ -78,9 +82,12 @@ impl<L: LogStore> Kv<L> {
       })
       .max();
 
+    info!("the latest ss table id is {:?}", latest_id);
+
     Ok(latest_id)
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
     let mut inner = self.inner.write().await;
 
@@ -105,6 +112,7 @@ impl<L: LogStore> Kv<L> {
     Ok(())
   }
 
+  #[tracing::instrument(skip_all, fields(key_utf8 = %String::from_utf8_lossy(key)))]
   pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
     let inner = self.inner.read().await;
 
@@ -115,7 +123,16 @@ impl<L: LogStore> Kv<L> {
         match inner.index.get(key) {
           None => Ok(None),
           Some(entry) => {
+            info!(
+              "key value is not in the memtable, will try to get value from disk. file_id={}",
+              entry.file_id
+            );
+            dbg!(&entry);
             // TODO: how slow is it to open a file? Maybe cache it.
+            dbg!(String::from_utf8_lossy(&std::fs::read(format!(
+              "{}/sstable.{}",
+              &self.dir, entry.file_id
+            ))?));
             let mut file = File::open(format!("{}/sstable.{}", &self.dir, entry.file_id)).await?;
             file.seek(SeekFrom::Start(entry.offset)).await?;
             let mut buffer = vec![0; entry.value_len as usize];
@@ -127,6 +144,7 @@ impl<L: LogStore> Kv<L> {
     }
   }
 
+  #[tracing::instrument(skip_all)]
   pub async fn delete(&self, key: &[u8]) -> Result<bool> {
     let mut inner = self.inner.write().await;
 
@@ -142,8 +160,11 @@ impl<L: LogStore> Kv<L> {
   }
 
   /// Saves the data we have in memory on the disk.
+  #[tracing::instrument(skip_all)]
   async fn flush_memtable_to_disk(&self) -> Result<()> {
     let mut inner = self.inner.write().await;
+
+    info!("mem table has {} entries", inner.memtable.len());
 
     let memtable = std::mem::take(&mut inner.memtable);
 
@@ -167,6 +188,7 @@ impl<L: LogStore> Kv<L> {
       // Point offset to the value.
       offset += key.len() as u64;
 
+      ss_index_writer.write_u32(table_id).await?;
       ss_index_writer.write_u32(key.len() as u32).await?;
       ss_index_writer.write_u32(value.len() as u32).await?;
       ss_index_writer.write_all(&key).await?;
@@ -183,6 +205,7 @@ impl<L: LogStore> Kv<L> {
   }
 
   // Creates a file to save sstable contents.
+  #[tracing::instrument(skip_all)]
   async fn create_ss_table_file(&self, table_id: u32) -> Result<File> {
     let file = tokio::fs::OpenOptions::new()
       .read(true)
@@ -192,9 +215,12 @@ impl<L: LogStore> Kv<L> {
       .open(format!("{}/sstable.{}", self.dir, table_id))
       .await?;
 
+    info!("created ss table file. file_id={}", table_id);
+
     Ok(file)
   }
 
+  #[tracing::instrument(skip_all)]
   async fn create_ss_index_file(&self, table_id: u32) -> Result<File> {
     let file = tokio::fs::OpenOptions::new()
       .read(true)
@@ -204,21 +230,186 @@ impl<L: LogStore> Kv<L> {
       .open(format!("{}/index.{}", self.dir, table_id))
       .await?;
 
+    info!("created index file. file_id={}", table_id);
+
     Ok(file)
   }
 
-  async fn merge_ss_index_files(&self) {
+  #[tracing::instrument(skip_all)]
+  async fn merge_ss_index_files(&self) -> Result<()> {
     // TODO: parallel merge files on disk
+
+    let mut file_paths = fs::list_index_files(&self.dir)
+      .await?
+      .into_iter()
+      .map(|file_path| {
+        let file_id = file_path
+          .split('.')
+          .last()
+          .map(String::from)
+          .expect("unable to get index file id");
+
+        (file_id, file_path)
+      })
+      .collect::<Vec<_>>();
+
+    info!("found index files. num_files={}", file_paths.len());
+
+    if file_paths.is_empty() {
+      return Ok(());
+    }
+
+    // Sort by the file name id.
+    // The oldest file has the lowest id number.                   \/
+    // "/tmp/testing_dir/9758f565-0ce1-4b3a-a9c3-f37c5f410534/index.1",
+    // "/tmp/testing_dir/9758f565-0ce1-4b3a-a9c3-f37c5f410534/index.0",
+    // "/tmp/testing_dir/9758f565-0ce1-4b3a-a9c3-f37c5f410534/index.2",
+    file_paths.sort_by_key(|(file_id, _file_path)| file_id.clone());
+
+    // SAFETY: We checked if file_paths is empty above.
+    let (_newest_index_file_id, newest_index_file_path) = file_paths.last().unwrap();
+
+    info!("newest index file. file_path={}", newest_index_file_path);
+
+    let new_merged_index_file_path = format!("{}.merge", newest_index_file_path);
+
+    let mut writer = BufWriter::new(
+      tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .append(true)
+        .create(true)
+        .open(&new_merged_index_file_path)
+        .await?,
+    );
+
+    info!(
+      "created file for merged index. file_path={}",
+      &new_merged_index_file_path
+    );
+
+    for (_file_id, file_path) in file_paths.iter() {
+      info!("merging index file. file_path={}", file_path);
+
+      let mut reader = BufReader::new(File::open(file_path).await?);
+
+      let mut records = 0;
+
+      loop {
+        let table_id = match reader.read_u32().await {
+          Err(err) => {
+            if err.kind() == ErrorKind::UnexpectedEof {
+              // We reached the last entry in the file.
+              break;
+            }
+            return Err(err.into());
+          }
+          Ok(value) => value,
+        };
+        let key_len = reader.read_u32().await?;
+        let value_len = reader.read_u32().await?;
+        let mut key = vec![0; key_len as usize];
+        reader.read_exact(&mut key).await?;
+        let offset = reader.read_u64().await?;
+
+        info!(
+          "key {} is at offset {}",
+          String::from_utf8_lossy(&key),
+          offset
+        );
+
+        writer.write_u32(table_id).await?;
+        writer.write_u32(key_len).await?;
+        writer.write_u32(value_len).await?;
+        writer.write_all(&key).await?;
+        writer.write_u64(offset).await?;
+
+        records += 1;
+      }
+
+      info!("merged {} records", records);
+    }
+
+    writer.flush().await?;
+
+    for (_file_id, file_path) in file_paths.iter() {
+      info!("removing merged index file. file_path={}", file_path);
+      tokio::fs::remove_file(file_path).await?;
+    }
+
+    info!("replacing newest index file with merged one. newest_index_file_path={} merged_index_file_path={}",newest_index_file_path, new_merged_index_file_path);
+    tokio::fs::rename(new_merged_index_file_path, newest_index_file_path).await?;
+
+    Ok(())
+  }
+
+  #[tracing::instrument(skip_all)]
+  async fn read_index_files(&self) -> Result<()> {
+    let file_paths = fs::list_index_files(&self.dir)
+      .await?
+      .into_iter()
+      .map(|file_path| {
+        let file_id = file_path
+          .split('.')
+          .last()
+          .map(String::from)
+          .expect("unable to get index file id");
+
+        (file_id, file_path)
+      })
+      .collect::<Vec<_>>();
+
+    info!("found index files. files={:?}", &file_paths);
+
+    let mut inner = self.inner.write().await;
+
+    for (_file_id, file_path) in file_paths.into_iter() {
+      info!("reading index file. file_path={}", file_path);
+
+      let mut reader = BufReader::new(File::open(file_path).await?);
+
+      let mut records = 0;
+
+      loop {
+        let file_id = match reader.read_u32().await {
+          Err(err) => {
+            if err.kind() == ErrorKind::UnexpectedEof {
+              // We reached the last entry in the file.
+              break;
+            }
+            return Err(err.into());
+          }
+          Ok(value) => value,
+        };
+        let key_len = reader.read_u32().await?;
+        let value_len = reader.read_u32().await?;
+        let mut key = vec![0; key_len as usize];
+        reader.read_exact(&mut key).await?;
+        let offset = reader.read_u64().await?;
+
+        inner.index.insert(
+          key,
+          IndexEntry {
+            key_len,
+            value_len,
+            file_id,
+            offset,
+          },
+        );
+
+        records += 1;
+      }
+
+      info!("done reading records. num_records={}", records);
+    }
+
+    Ok(())
   }
 }
 
 #[cfg(test)]
 mod put_tests {
-  use crate::{
-    commit_log::CommitLog,
-    constants::{CHECKSUM_SIZE_IN_BYTES, KEY_LEN_SIZE_IN_BYTES, VALUE_LEN_SIZE_IN_BYTES},
-    tests::support,
-  };
+  use crate::{commit_log::CommitLog, tests::support};
 
   use super::*;
   use mockall::predicate::eq;
@@ -262,15 +453,12 @@ mod put_tests {
     kv.put(key.clone(), value.clone()).await?;
 
     assert_eq!(
-      kv.inner.read().await.index.get(&key),
+      dbg!(kv.inner.read().await.index.get(&key)),
       Some(&IndexEntry {
         file_id: 0,
         key_len: key.len() as u32,
         value_len: value.len() as u32,
-        offset: CHECKSUM_SIZE_IN_BYTES
-          + KEY_LEN_SIZE_IN_BYTES
-          + VALUE_LEN_SIZE_IN_BYTES
-          + key.len() as u64
+        offset: key.len() as u64
       })
     );
 
@@ -280,7 +468,7 @@ mod put_tests {
 
 #[cfg(test)]
 mod get_latest_ss_table_id_tests {
-  use crate::tests::support;
+  use crate::{commit_log::CommitLog, tests::support};
 
   use super::*;
 
@@ -290,7 +478,10 @@ mod get_latest_ss_table_id_tests {
     let tempdir = support::file::temp_dir();
 
     {
-      let kv = Kv::new(tempdir.path.clone(), MockLogStore::new())?;
+      let kv = Kv::new(
+        tempdir.path.clone(),
+        CommitLog::new(tempdir.path.clone()).await?,
+      )?;
 
       // Started with no ss tables.
       assert_eq!(None, kv.inner.read().await.latest_ss_table_id);
@@ -300,7 +491,10 @@ mod get_latest_ss_table_id_tests {
     }
 
     {
-      let kv = Kv::new(tempdir.path.clone(), MockLogStore::new())?;
+      let kv = Kv::new(
+        tempdir.path.clone(),
+        CommitLog::new(tempdir.path.clone()).await?,
+      )?;
 
       // Flushed to disk once, so there's a sstable.
       assert_eq!(Some(0), kv.inner.read().await.latest_ss_table_id);
@@ -310,7 +504,10 @@ mod get_latest_ss_table_id_tests {
     }
 
     {
-      let kv = Kv::new(tempdir.path.clone(), MockLogStore::new())?;
+      let kv = Kv::new(
+        tempdir.path.clone(),
+        CommitLog::new(tempdir.path.clone()).await?,
+      )?;
       // Flushed to disk twice, so there's two sstables.
       assert_eq!(Some(1), kv.inner.read().await.latest_ss_table_id);
     }
@@ -508,12 +705,17 @@ mod flush_memtable_to_disk_tests {
 
         kv.flush_memtable_to_disk().await?;
 
+        let latest_ss_table_id = kv.inner.read().await.latest_ss_table_id;
+
         let files = support::file::list_dir_files(&tempdir.path);
 
         let mut index = File::open(files.iter().find(|path| path.contains("index")).unwrap()).await?;
         let mut sstable = File::open(files.iter().find(|path| path.contains("sstable")).unwrap()).await?;
 
         for (key, value) in entries.into_iter(){
+          let file_id = index.read_u32().await?;
+          assert_eq!(Some(file_id), latest_ss_table_id);
+
           let key_len = index.read_u32().await?;
           assert_eq!(key.len() as u32, key_len);
 
@@ -560,10 +762,6 @@ mod flush_memtable_to_disk_tests {
 
     // Create the second sstable.
     kv.flush_memtable_to_disk().await?;
-
-    let files = support::file::list_dir_files(&tempdir.path);
-
-    dbg!(&files);
 
     Ok(())
   }
@@ -658,6 +856,54 @@ mod delete_tests {
 
     // Should return true because the key is in the index.
     assert!(kv.delete(&key).await?);
+
+    Ok(())
+  }
+}
+
+#[cfg(test)]
+mod merge_ss_index_files_tests {
+  use crate::{commit_log::CommitLog, tests::support};
+
+  use super::*;
+
+  #[tokio::test]
+  async fn can_get_key_values_after_index_files_are_merged(
+  ) -> Result<(), Box<dyn std::error::Error>> {
+    let tempdir = support::file::temp_dir();
+
+    let kv = Kv::new(
+      tempdir.path.clone(),
+      CommitLog::new(tempdir.path.clone()).await?,
+    )?;
+
+    kv.put(b"key_1".to_vec(), b"value_1".to_vec()).await?;
+    kv.flush_memtable_to_disk().await?;
+
+    kv.put(b"key_2".to_vec(), b"value_2".to_vec()).await?;
+
+    kv.flush_memtable_to_disk().await?;
+
+    kv.put(b"key_3".to_vec(), b"value_3".to_vec()).await?;
+    kv.flush_memtable_to_disk().await?;
+
+    // Indexes should be merged into a single file.
+    kv.merge_ss_index_files().await?;
+
+    // Remove values and index from memory.
+    kv.inner.write().await.memtable.clear();
+    kv.inner.write().await.index.clear();
+
+    // Read the new index file from disk.
+    kv.read_index_files().await?;
+
+    dbg!(&kv.inner.read().await.index);
+
+    // Values are not in memory but the index is, so values
+    // should be searched for in the disk.
+    assert_eq!(kv.get(b"key_1").await?, Some(b"value_1".to_vec()));
+    assert_eq!(kv.get(b"key_2").await?, Some(b"value_2".to_vec()));
+    assert_eq!(kv.get(b"key_3").await?, Some(b"value_3".to_vec()));
 
     Ok(())
   }
